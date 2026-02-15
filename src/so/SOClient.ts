@@ -1,0 +1,445 @@
+export type SOResponse = Record<string, any>;
+
+type Uint8 = Uint8Array;
+
+/**
+ * Simple async mutex (like synchronized Lock in Dart)
+ */
+class Mutex {
+  private queue: Array<() => void> = [];
+  private locked = false;
+
+  async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      return await fn();
+    } finally {
+      this.release();
+    }
+  }
+
+  private acquire(): Promise<void> {
+    if (!this.locked) {
+      this.locked = true;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => this.queue.push(resolve));
+  }
+
+  private release() {
+    const next = this.queue.shift();
+    if (next) next();
+    else this.locked = false;
+  }
+}
+
+function delay(ms: number) {
+  return new Promise<void>((r) => setTimeout(r, ms));
+}
+
+function asString(e: any) {
+  if (e instanceof Error) return e.message;
+  return String(e);
+}
+
+/**
+ * SO Platform Client (Dart model)
+ *
+ * Usage:
+ *   const c = new SOClient("storedobject.com", "yatramitra", 1024, 768, true, apiKey);
+ *   const err = await c.login("user", "pass");
+ *   const r = await c.command("someCommand", {x:1});
+ */
+export class SOClient {
+  // Application name
+  public readonly application: string;
+
+  // Device width/height
+  public readonly deviceWidth: number;
+  public readonly deviceHeight: number;
+
+  // API key (optional)
+  public readonly apiKey: string;
+
+  // API version (fixed like Dart)
+  public readonly apiVersion: number = 1;
+
+  private ws: WebSocket;
+  private subscriptionActive = true;
+
+  private lock = new Mutex();
+  private lockBinary = new Mutex();
+
+  private username_ = "";
+  private password_ = "";
+  private session_ = "";
+  private otpEmail_ = "";
+
+  private received: string[] = [];
+  private receivedBinary: Uint8[] = [];
+
+  constructor(
+    host: string,
+    application: string,
+    deviceWidth = 1024,
+    deviceHeight = 768,
+    secured = true,
+    apiKey = ""
+  ) {
+    this.application = application;
+    this.deviceWidth = deviceWidth;
+    this.deviceHeight = deviceHeight;
+    this.apiKey = apiKey;
+
+    const url = `ws${secured ? "s" : ""}://${host}/${application}/CONNECTORWS`;
+
+    // RN WebSocket supports (url, protocols?)
+    // Dart used 'Bearer <apiKey>' as a protocol if apiKey set.
+    const protocols = apiKey && apiKey.length > 0 ? [`Bearer ${apiKey}`] : undefined;
+
+    this.ws = new WebSocket(url, protocols);
+
+    this.ws.onmessage = (event) => {
+      const msg: any = (event as any).data;
+      // RN may give string or ArrayBuffer
+      if (typeof msg === "string") {
+        this.received.push(msg);
+      } else if (msg instanceof ArrayBuffer) {
+        this.receivedBinary.push(new Uint8Array(msg));
+      } else if (msg && (msg as any).byteLength != null) {
+        // sometimes Blob-like / typed array
+        try {
+          // best effort
+          this.receivedBinary.push(new Uint8Array(msg));
+        } catch {
+          // ignore
+        }
+      }
+    };
+
+    this.ws.onerror = () => {
+      // We don't throw here — Dart code also doesn't.
+      // Requests will time out or fail when waiting for data.
+    };
+
+    this.ws.onclose = () => {
+      this.subscriptionActive = false;
+    };
+  }
+
+  // --- getters like Dart ---
+  get username() {
+    return this.username_;
+  }
+
+  checkPassword(password: string) {
+    return password === this.password_;
+  }
+
+  // --- lifecycle ---
+  async logout(): Promise<void> {
+    try {
+      await this.command("logout", {});
+      this.subscriptionActive = false;
+      try {
+        this.ws.close();
+      } catch {}
+    } finally {
+      this.session_ = "";
+      this.password_ = "";
+      this.username_ = "";
+    }
+  }
+
+  // --- auth ---
+  async login(username: string, password = ""): Promise<string> {
+    if (this.username_ !== "") return "Already logged in";
+    if (username === "") return "Username can't be empty";
+
+    const map: SOResponse = {
+      command: "login",
+      user: username,
+      password,
+      version: this.apiVersion,
+      deviceWidth: this.deviceWidth,
+      deviceHeight: this.deviceHeight,
+    };
+
+    this.session_ = "";
+    const r = await this.post(map);
+    if (r["status"] !== "OK") return String(r["message"] ?? "Login failed");
+
+    this.session_ = String(r["session"] ?? "");
+    this.username_ = username;
+    this.password_ = password;
+    return "";
+  }
+
+  async otp(email: string, mobile = ""): Promise<SOResponse> {
+    this.otpEmail_ = email;
+    const map: SOResponse = { action: "init", email, mobile };
+    return this.command("otp", map);
+  }
+
+  async otpLogin(emailOTP: number, mobileOTP = 0): Promise<string> {
+    if (this.username_ !== "") return "Already logged in";
+    if (this.otpEmail_ === "" || this.session_ === "") return "OTP was not generated";
+
+    const map: SOResponse = {
+      command: "otp",
+      action: "login",
+      continue: true,
+      session: this.session_,
+      emailOTP,
+      mobileOTP,
+      version: this.apiVersion,
+      deviceWidth: this.deviceWidth,
+      deviceHeight: this.deviceHeight,
+    };
+
+    const r = await this.post(map);
+    if (r["status"] !== "OK") return String(r["message"] ?? "OTP login failed");
+
+    this.session_ = String(r["session"] ?? "");
+    this.username_ = this.otpEmail_;
+    this.password_ = r["secret"] ?? "";
+    return "";
+  }
+
+  async changePassword(currentPassword: string, newPassword: string): Promise<string> {
+    if (!this.checkPassword(currentPassword)) return "Current password is incorrect";
+
+    const r = await this.command("changePassword", {
+      oldPassword: this.password_,
+      newPassword,
+    });
+
+    if (r["status"] === "OK") {
+      this.password_ = newPassword;
+      return "";
+    }
+    return String(r["message"] ?? "Password change failed");
+  }
+
+  // --- core command API (matches Dart) ---
+  async command(command: string, attributes: SOResponse, preserveServerState = false): Promise<SOResponse> {
+    return this._command(command, attributes, true, preserveServerState, true);
+  }
+
+  async info(command: string, attributes: SOResponse): Promise<SOResponse> {
+    return this._command(command, attributes, true, false, false);
+  }
+
+  // --- stream/file/report model (binary follows JSON response) ---
+  async stream(name: string): Promise<[Uint8 | null, string | null, string | null]> {
+    return this._stream("stream", name);
+  }
+
+  async file(name: string): Promise<[Uint8 | null, string | null, string | null]> {
+    return this._stream("file", name);
+  }
+
+  async report(
+    logic: string,
+    parameters?: SOResponse
+  ): Promise<[Uint8 | null, string | null, string | null]> {
+    let m: SOResponse | undefined;
+    if (parameters) {
+      const p = (parameters as any)["parameters"];
+      if (p && typeof p === "object" && !Array.isArray(p)) m = parameters;
+      else m = { parameters };
+    }
+    return this._stream("report", logic, m);
+  }
+
+  async upload(mimeType: string, data: Uint8, streamNameOrID = ""): Promise<SOResponse> {
+    let map = await this._upload(mimeType, streamNameOrID);
+    if (map == null) map = await this.postBinary(data);
+    delete map["session"];
+    return map;
+  }
+
+  // NOTE: React Native WebSocket cannot stream incremental chunks like Dart addStream easily.
+  // You can still send one binary payload. For real streaming, we can chunk it manually.
+  async uploadStream(mimeType: string, data: AsyncIterable<Uint8>, streamNameOrID = ""): Promise<SOResponse> {
+    // minimal chunked implementation: concatenate (safe for small/medium payloads)
+    const chunks: Uint8[] = [];
+    let total = 0;
+    for await (const c of data) {
+      chunks.push(c);
+      total += c.byteLength;
+    }
+    const merged = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+      merged.set(c, off);
+      off += c.byteLength;
+    }
+    return this.upload(mimeType, merged, streamNameOrID);
+  }
+
+  // ------------- internal helpers (close to Dart) -------------
+
+  private error(error: string): SOResponse {
+    return { status: "ERROR", message: error };
+  }
+
+  private action(attributes: SOResponse): string {
+    const a = attributes["action"];
+    return typeof a === "string" ? a : "";
+  }
+
+  private setOTPEmail(attributes: SOResponse) {
+    const email = attributes["email"];
+    if (email != null) this.otpEmail_ = String(email);
+  }
+
+  private async _command(
+    command: string,
+    attributes: SOResponse,
+    checkCommand: boolean,
+    preserveServerState: boolean,
+    loginRequired: boolean
+  ): Promise<SOResponse> {
+    let sessionRequired = loginRequired;
+
+    if (sessionRequired && command === "register") {
+      loginRequired = false;
+      const act = this.action(attributes);
+      sessionRequired = !(act === "init" || act === "otp");
+    } else if (sessionRequired && command === "otp") {
+      const act = this.action(attributes);
+      sessionRequired = act !== "init";
+      if (sessionRequired) loginRequired = act !== "verify";
+    }
+
+    if (!sessionRequired) this.setOTPEmail(attributes);
+
+    if (sessionRequired && ((loginRequired && this.username_ === "") || this.session_ === "")) {
+      return this.error("Not logged in");
+    }
+
+    if (checkCommand) {
+      switch (command) {
+        case "file":
+        case "stream":
+          return this.error("Invalid command");
+      }
+    }
+
+    if (sessionRequired) attributes["session"] = this.session_;
+    attributes["command"] = command;
+    if (preserveServerState) attributes["continue"] = true;
+
+    const r = await this.post(attributes);
+
+    if (r["status"] === "LOGIN") {
+      this.session_ = String(r["session"] ?? "");
+      const u = this.username_;
+      this.username_ = "";
+      const st = await this.login(u, this.password_);
+      if (st !== "") return this.error(`Can't re-login. Reason: ${st}`);
+
+      // Re-run command (Dart does: return await this.command(command, attributes, false); )
+      // Important: avoid recursion with checkCommand to false
+      return await this._command(command, attributes, false, preserveServerState, true);
+    } else if (!sessionRequired) {
+      this.session_ = String(r["session"] ?? "");
+    }
+
+    delete r["session"];
+    return r;
+  }
+
+  private async _stream(
+    command: "stream" | "file" | "report",
+    name: string,
+    parameters?: SOResponse
+  ): Promise<[Uint8 | null, string | null, string | null]> {
+    const params: SOResponse = parameters ? { ...parameters } : {};
+    params[command] = name;
+
+    const r = await this._command(command, params, false, false, true);
+    if (r["status"] === "ERROR") {
+      return [null, null, String(r["message"] ?? "ERROR")];
+    }
+
+    // binary is received after the json response
+    return await this.lockBinary.runExclusive(async () => {
+      const bin = await this.receiveBinary();
+      return [bin, String(r["type"] ?? ""), null];
+    });
+  }
+
+  private async _upload(mimeType: string, streamNameOrID = ""): Promise<SOResponse | null> {
+    const map: SOResponse = {
+      type: mimeType,
+      ...(streamNameOrID !== "" ? { stream: streamNameOrID } : {}),
+    };
+    const r = await this.command("upload", map);
+    return r["status"] === "OK" ? null : r;
+  }
+
+  /**
+   * Dart model: lock -> send -> wait for next string message
+   */
+  private async post(map: SOResponse): Promise<SOResponse> {
+    return await this.lock.runExclusive(async () => {
+      try {
+        await this.ensureOpen();
+        this.ws.send(JSON.stringify(map));
+        const msg = await this.receive();
+        return JSON.parse(msg) as SOResponse;
+      } catch (e: any) {
+        return this.error(asString(e));
+      }
+    });
+  }
+
+  private async postBinary(data: Uint8): Promise<SOResponse> {
+    return await this.lock.runExclusive(async () => {
+      try {
+        await this.ensureOpen();
+        // RN WebSocket supports ArrayBuffer/TypedArray
+        this.ws.send(data);
+        const msg = await this.receive();
+        return JSON.parse(msg) as SOResponse;
+      } catch (e: any) {
+        return this.error(asString(e));
+      }
+    });
+  }
+
+  private async ensureOpen(): Promise<void> {
+    // Wait until socket is open (like implicit in Dart channel connect)
+    const start = Date.now();
+    while (this.ws.readyState === WebSocket.CONNECTING) {
+      await delay(50);
+      if (Date.now() - start > 10_000) throw new Error("WebSocket connect timeout");
+    }
+    if (this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error("WebSocket not connected");
+    }
+  }
+
+  private async receive(): Promise<string> {
+    // Dart: while (_received.isEmpty) delay(100)
+    while (this.received.length === 0) {
+      if (!this.subscriptionActive && this.ws.readyState !== WebSocket.OPEN) {
+        throw new Error("WebSocket closed");
+      }
+      await delay(100);
+    }
+    return this.received.shift()!;
+  }
+
+  private async receiveBinary(): Promise<Uint8> {
+    while (this.receivedBinary.length === 0) {
+      if (!this.subscriptionActive && this.ws.readyState !== WebSocket.OPEN) {
+        throw new Error("WebSocket closed");
+      }
+      await delay(100);
+    }
+    return this.receivedBinary.shift()!;
+  }
+}
