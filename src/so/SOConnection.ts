@@ -80,20 +80,12 @@ export class SOConnection {
     );
   }
 
-  /**
-   * Drops the current socket + client instance and creates a fresh one.
-   * (Your Flutter pattern: _client = Client(host, application))
-   */
   reset(): void {
     this._client = this.createClient();
     this._lastUsername = "";
     this._lastPassword = "";
   }
 
-  /**
-   * Returns the underlying client if you need low-level access.
-   * Keep usage minimal to avoid bypassing the wrapper.
-   */
   rawClient(): SOClient {
     return this._client;
   }
@@ -132,9 +124,7 @@ export class SOConnection {
   }
 
   /**
-   * Optional helper: attempt re-login using the last successful credentials you provided.
-   * Useful when server returns status=LOGIN and SOClient attempts re-login internally;
-   * but exposing it here can be handy for UI flows.
+   * Attempt re-login using the last successful credentials you provided.
    */
   async relogin(): Promise<string> {
     if (!this._lastUsername) return "No previous username available";
