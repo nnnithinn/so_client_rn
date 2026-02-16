@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "main": "lib/commonjs/index.js",
   "module": "lib/module/index.js",
-  "types": "lib/typescript/src/index.d.ts",
+  "types": "lib/typescript/module/index.d.ts",
   "react-native": "src/index.ts",
   "files": [
     "src",
@@ -22,6 +22,9 @@
     "test:pack": "npm pack"
   },
   "devDependencies": {
+    "@react-native/typescript-config": "^0.84.0",
+    "@types/jest": "^30.0.0",
+    "@types/react-native": "^0.72.8",
     "react-native-builder-bob": "^0.40.0",
     "typescript": "^5.8.3"
   },
@@ -29,8 +32,18 @@
     "source": "src",
     "output": "lib",
     "targets": [
-      ["commonjs", { "esm": false }],
-      ["module", { "esm": true }],
+      [
+        "commonjs",
+        {
+          "esm": false
+        }
+      ],
+      [
+        "module",
+        {
+          "esm": true
+        }
+      ],
       "typescript"
     ]
   },
